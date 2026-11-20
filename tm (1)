@@ -1,0 +1,163 @@
+#!/usr/bin/env bash
+#
+# tm — a local "undo button" for whatever directory you run it in.
+#
+# It keeps a hidden, separate snapshot history (in .tm/) of your working
+# directory so you can rewind after running a risky command or script.
+# It does NOT touch your shell history, system logs, or any real git repo
+# you already have — everything it does is visible if you look in .tm/.
+#
+# Commands:
+#   tm init                 Set up snapshot tracking in the current directory
+#   tm run <command...>     Snapshot, then run <command> normally
+#   tm snap "<label>"       Take a manual snapshot with a label
+#   tm list                 List snapshots (id, time, label)
+#   tm diff <id>            Show what changed since snapshot <id>
+#   tm rewind <id>          Restore the directory to snapshot <id>
+#   tm help                 Show this help
+#
+set -euo pipefail
+
+TM_DIR=".tm"
+TM_GITDIR="$TM_DIR/snapshots.git"
+
+die() { echo "tm: $*" >&2; exit 1; }
+
+require_init() {
+  [ -d "$TM_GITDIR" ] || die "not initialized here. Run 'tm init' first."
+}
+
+git_tm() {
+  git --git-dir="$TM_GITDIR" --work-tree="$(pwd)" "$@"
+}
+
+cmd_init() {
+  if [ -d "$TM_GITDIR" ]; then
+    echo "tm: already initialized here."
+    exit 0
+  fi
+  mkdir -p "$TM_DIR"
+  git init --quiet --bare "$TM_GITDIR"
+  git_tm config user.email "tm@local"
+  git_tm config user.name "tm"
+  # Ignore tm's own bookkeeping dir inside snapshots themselves.
+  git_tm config core.excludesFile /dev/null
+  echo "tm: initialized snapshot tracking in $TM_DIR/"
+  echo "tm: nothing is snapshotted yet — run 'tm snap \"initial\"' or 'tm run <cmd>'."
+}
+
+do_snapshot() {
+  local label="$1"
+  git_tm add -A -- . ":!${TM_DIR}" 2>/dev/null || git_tm add -A .
+  if git_tm diff --cached --quiet 2>/dev/null; then
+    # Nothing changed since last snapshot — still record a marker commit
+    # only if this is the very first snapshot.
+    if ! git_tm rev-parse HEAD >/dev/null 2>&1; then
+      git_tm commit --quiet --allow-empty -m "$label"
+    else
+      echo "tm: no changes since last snapshot; skipping."
+      return
+    fi
+  else
+    git_tm commit --quiet -m "$label"
+  fi
+  local id
+  id=$(git_tm rev-parse --short HEAD)
+  echo "tm: snapshot $id — $label"
+}
+
+cmd_snap() {
+  require_init
+  local label="${1:-manual snapshot}"
+  do_snapshot "$label"
+}
+
+cmd_run() {
+  require_init
+  [ $# -ge 1 ] || die "usage: tm run <command...>"
+  do_snapshot "before: $*"
+  echo "tm: running: $*"
+  echo "---"
+  # Run the command normally — all output goes straight to the real
+  # terminal, nothing is suppressed or redirected.
+  "$@"
+  local status=$?
+  echo "---"
+  do_snapshot "after: $* (exit $status)"
+  exit $status
+}
+
+cmd_list() {
+  require_init
+  if ! git_tm rev-parse HEAD >/dev/null 2>&1; then
+    echo "tm: no snapshots yet."
+    exit 0
+  fi
+  git_tm log --date=format:'%Y-%m-%d %H:%M:%S' --pretty=tformat:'%h  %ad  %s' | tac
+}
+
+cmd_diff() {
+  require_init
+  [ $# -eq 1 ] || die "usage: tm diff <id>"
+  git_tm diff "$1" -- . ":!${TM_DIR}" 2>/dev/null || git_tm diff "$1"
+}
+
+cmd_rewind() {
+  require_init
+  [ $# -eq 1 ] || die "usage: tm rewind <id>"
+  local id="$1"
+  git_tm rev-parse --verify "$id" >/dev/null 2>&1 || die "no such snapshot: $id"
+
+  echo "tm: this will overwrite files in the current directory to match"
+  echo "    snapshot $id. Files created after that snapshot (and not since"
+  echo "    re-snapshotted) will be deleted."
+  read -r -p "tm: proceed? [y/N] " confirm
+  case "$confirm" in
+    y|Y|yes|YES) ;;
+    *) echo "tm: aborted."; exit 1 ;;
+  esac
+
+  # Safety snapshot of current state before rewinding, so a rewind is
+  # itself undoable.
+  do_snapshot "auto-snapshot before rewind to $id"
+
+  git_tm checkout "$id" -- . ":!${TM_DIR}" 2>/dev/null || git_tm checkout "$id" -- .
+
+  # Remove files that exist now but didn't exist at that snapshot.
+  local tmpfile
+  tmpfile=$(mktemp)
+  git_tm ls-tree -r --name-only "$id" > "$tmpfile"
+  while IFS= read -r f; do
+    case "$f" in
+      "$TM_DIR"/*) continue ;;
+    esac
+    if ! grep -qxF "$f" "$tmpfile"; then
+      rm -f -- "$f"
+    fi
+  done < <(git_tm ls-tree -r --name-only HEAD)
+  rm -f "$tmpfile"
+
+  do_snapshot "rewound to $id"
+  echo "tm: rewound to snapshot $id."
+}
+
+cmd_help() {
+  sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+main() {
+  local sub="${1:-help}"
+  shift || true
+  case "$sub" in
+    init)   cmd_init "$@" ;;
+    run)    cmd_run "$@" ;;
+    snap)   cmd_snap "$@" ;;
+    list)   cmd_list "$@" ;;
+    diff)   cmd_diff "$@" ;;
+    rewind) cmd_rewind "$@" ;;
+    help|-h|--help) cmd_help ;;
+    *) die "unknown command '$sub'. Run 'tm help'." ;;
+  esac
+}
+
+main "$@"
